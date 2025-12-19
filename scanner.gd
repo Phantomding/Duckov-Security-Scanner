@@ -1,193 +1,256 @@
 extends Control
 
-
-# 🚫 违禁品名单 (Native API)
-# 正常的 C# Mod 绝不需要直接调用这些 Windows 底层函数
-# 如果出现了，说明它想绕过游戏引擎干坏事（读写内存、注入病毒、执行CMD）
-var forbidden_imports = {
-	"KERNEL32.dll": 50,  # 操作内存/进程的核心库
-	"USER32.dll": 30,    # 监控键盘/鼠标
-	"SHELL32.dll": 80,   # 执行系统命令 (cmd/powershell)
-	"ADVAPI32.dll": 60,  # 修改注册表
-	"VirtualProtect": 100, # 修改内存权限 (典型的病毒注入行为)
-	"WriteProcessMemory": 100, # 修改游戏内存 (外挂/病毒特征)
-	"GetProcAddress": 80, # 动态获取函数地址 (躲避静态查杀的常用手段)
-	"InternetOpen": 60   # 底层联网 (非Unity联网)
-}
-
-# ================= 配置区域 =================
-
-# 1. 威胁评分规则 (正则 : 分数)
-# 分数越高越危险。
-# 正则说明：(?!schemas) 是为了防止 xml 文件头里的 http 误报
-# === 优化后的规则库 v1.2 ===
-var risk_rules = {
-	# --- 1. 进程与系统操作 (精准打击) ---
-	# "System\\.Diagnostics": 5,  <-- 删除！太容易误伤计时器等功能
-	"Process\\.Start": 25,        # 启动外部程序 (比如悄悄运行一个 .bat 或 .exe)
-	"Application\\.Quit": 100,    # 强制退出游戏 (逻辑炸弹核心)
-	"Environment\\.Exit": 100,    # 另一种强制退出
-
-	# --- 2. 敏感文件操作 ---
-	"File\\.Delete": 30,          # 删除文件 (正常Mod很少需要删文件)
-	"Directory\\.Delete": 30,     # 删除文件夹
-	"File\\.Copy": 10,            # 复制/覆盖文件 (可能是篡改)
-	
-	# --- 3. 网络行为 (区分“浏览”和“偷窃”) ---
-	# "System\\.Net": 5,          <-- 删除！只要联网就报毒太蠢了
-	"WebClient\\.Upload": 50,     # 上传数据 (偷隐私嫌疑大)
-	"HttpClient\\.Post": 30,      # 发送 POST 请求 (可能在上传)
-	"DownloadFile": 20,           # 下载文件 (如果是下载 exe 则是高危)
-	
-	# --- 4. 动态代码执行 (后门特征) ---
-	"Assembly\\.Load": 60,        # 动态加载二进制代码 (极度危险，类似远程控制)
-	"System\\.Reflection": 10,    # 反射 (正常Mod也会用，权重给低点，仅作提示)
-
-	# --- 5. 针对性恶意特征 ---
-	"SteamID": 40,                # 配合 Quit 使用通常是炸弹
-	"CheckSteamUID": 60,          # 恶意函数名特征
-	"3600714295": 1000            # 已知的恶意作者ID
-}
-
-# 2. 白名单指纹库 (文件名 : [合法的MD5列表])
-# 如果你的扫描器以后报错了正版文件，先用 get_md5() 获取它的哈希，填入这里
-var safe_file_hashes = {
-	"0Harmony.dll": [
-		"2afc09f2cd4cba05d85cc7c4f7d62edb", 
-		"如果有多个版本可以填第二行" 
-	],
-	"BepInEx.dll": [
-		"这里填入正版BepInEx的MD5"
-	],
-}
-
-
-# 🚫 黑名单指纹库 (已知的病毒文件 MD5)
-# 只要碰到这个指纹，不管叫什么名字，直接报毒
-var dangerous_file_hashes = [
-	# 这里填入 RandomNpc.dll 的 MD5 (你可以用扫描器打印出来获取)
-	"这里填入你扫描出的RandomNpc的MD5值" ,
-	""
-]
-
-# 3. 忽略的大文件阈值 (字节)
-const MAX_FILE_SIZE = 50 * 1024 * 1024 # 50MB
-
-# ===========================================
-
+# === 🦆 Duckov Mod Inspector v1.3 核心配置 ===
+const MAX_FILE_SIZE = 20 * 1024 * 1024 # 20MB 限制
+var compiled_risk_rules = {}
+var is_scanning = false # 🔒 扫描锁：防止重复拖拽导致卡死
+# 节点引用 (根据你刚才修改的结构)
 @onready var status_label = $StatusLabel
-@onready var result_container = $ResultList/VBoxContainer
-@onready var mascot = $Mascot
+# 这里路径对应：MainScanner -> ResultScroll -> ResultText
+@onready var result_text = $ResultScroll/ResultText 
 
-# 缓存编译好的正则对象
-var compiled_rules = {}
+# 1. ℹ️ 能力透视 (Capabilities) - 中性描述
+var capability_rules = {
+	"System\\.Net": "基础网络访问 (System.Net)",
+	"UnityWebRequest": "HTTP 联网能力 (UnityWebRequest)",
+	"Socket": "Socket 长连接 (聊天/联机)",
+	"System\\.IO": "文件读写操作 (System.IO)",
+	"File\\.Write": "写入/修改文件",
+	"File\\.Delete": "删除文件",
+	"Directory\\.Delete": "删除文件夹",
+	"PlayerPrefs": "读写游戏配置/注册表",
+	"Discord": "Discord SDK 集成",
+	"Steamworks": "Steam API 集成"
+}
 
-# === 1. 初始化界面 (版本号 + 免责声明) ===
+# 2. 🚨 风险行为 (Risks) - 针对二进制拆解优化
+# 格式: "正则关键词": [分数, "显示的警告文本"]
+var risk_rules = {
+	# --- 🔴 极度高危 (逻辑炸弹) ---
+	"Environment\\.Exit": [100, "🔴 进程查杀: 包含强制终止进程代码 (Environment.Exit)"],
+	"3600714295": [1000, "🔴 黑名单: 已知恶意作者 ID"],
+	
+	# --- 🟠 高危行为 (拆解后的关键词，防止漏报) ---
+	# v1.3.1 修复: DLL中类名和方法名是分开存的，必须单搜 "Quit"
+	"Quit": [60, "🟠 退出逻辑: 发现 'Quit' 关键词 (可能包含 Application.Quit)"],
+	
+	# v1.3.1 修复: 针对 SteamID 的各种变形
+	"SteamId": [80, "🟠 身份读取: 发现 'SteamId' 属性引用"],
+	"CSteamID": [80, "🟠 身份读取: 发现 'CSteamID' 底层结构"],
+	"GetSteamID": [80, "🟠 身份读取: 发现获取 SteamID 的函数调用"],
+	
+	# --- 🟠 敏感操作 ---
+	"Process\\.Start": [40, "🟠 外部进程: 试图启动外部 EXE"],
+	"WebClient": [50, "🟠 网络组件: 发现 WebClient 引用"],
+	"HttpClient": [50, "🟠 网络组件: 发现 HttpClient 引用"],
+	"UploadString": [50, "🟠 数据上传: 发现上传字符串的代码"],
+	"UploadData": [50, "🟠 数据上传: 发现上传数据的代码"],
+	"Assembly\\.Load": [60, "🟠 动态加载: 试图加载二进制代码"],
+	
+	# --- 🟡 敏感 (Harmony豁免项) ---
+	"VirtualProtect": [20, "🟡 底层操作: 修改内存权限"],
+	"GetProcAddress": [20, "🟡 底层操作: 动态获取API地址"],
+	"KERNEL32": [20, "🟡 底层操作: 调用 Windows 内核 API"]
+}
+
 func _ready():
-	# A. 设置窗口标题和版本号
-	DisplayServer.window_set_title("Duckov Security Scanner v1.0.1 (Beta)")
+	DisplayServer.window_set_title("Duckov Mod Inspector v1.3")
 	
-	# B. 动态添加免责声明 (在窗口底部生成一行小字)
-	var disclaimer = Label.new()
-	disclaimer.text = "免责声明: 本工具基于社区已知特征开发，不能保证 100% 拦截未知病毒。删除文件前请务必备份。"
-	disclaimer.add_theme_font_size_override("font_size", 12) # 字体设小一点
-	disclaimer.modulate = Color(1, 1, 1, 0.5) # 半透明，不抢眼
-	
-	# 把它放到屏幕底部居中
-	disclaimer.set_anchors_and_offsets_preset(Control.PRESET_CENTER_BOTTOM)
-	disclaimer.position.y -= 10 # 往上提一点点
-	add_child(disclaimer)
-
-	# C. 原有的初始化逻辑
-	get_tree().get_root().files_dropped.connect(_on_files_dropped)
-	
-	# 预编译正则
+	# 编译正则
 	for pattern in risk_rules:
 		var regex = RegEx.new()
 		regex.compile(pattern)
-		compiled_rules[pattern] = regex
-		
-	status_label.text = "安全终端就绪。请拖入 Mod 文件夹..."
-	status_label.modulate = Color.WHITE
+		compiled_risk_rules[pattern] = regex
+	
+	# 连接全屏拖拽信号
+	get_viewport().files_dropped.connect(_on_files_dropped)
+	
+	status_label.text = "将 Mod (.dll) 拖入此处开始审计"
+	result_text.text = "[color=#888888]等待文件...[/color]"
 
 func _on_files_dropped(files):
-	var folder_path = files[0]
-	var dir = DirAccess.open(folder_path)
-	if dir:
-		start_scan(folder_path)
-	else:
-		status_label.text = "错误：请拖入一个有效的文件夹！"
-		status_label.modulate = Color.RED
-
-func start_scan(path):
-	# === 初始化 UI ===
-	for child in result_container.get_children():
-		child.queue_free()
-	
-	status_label.text = "正在初始化扫描引擎..."
-	status_label.modulate = Color.YELLOW
-	await get_tree().create_timer(0.3).timeout # 稍微停顿，增加仪式感
-	
-	# === 获取所有文件 ===
-	var all_files = get_all_files(path)
-	if all_files.size() == 0:
-		status_label.text = "文件夹为空或无法读取！"
+	# 🔒 1. 如果正在忙，直接忽略这次拖拽，防止卡死叠加
+	if is_scanning:
+		status_label.text = "⚠️ 正在忙，请稍后..."
 		return
 
-	# === 开始循环扫描 ===
-	var issues_found = 0
+	is_scanning = true # 上锁
+	result_text.text = "" # 清空旧结果
+	
+	var total_score = 0
+	var full_report = ""
+	var all_target_files = []
+	
+	# === 第一阶段：收集文件 (快速) ===
+	status_label.text = "正在分析文件列表..."
+	await get_tree().process_frame # 强制刷新UI
+	
+	for path in files:
+		if DirAccess.dir_exists_absolute(path):
+			# 如果是文件夹，获取里面所有dll
+			all_target_files.append_array(get_all_files(path, ["dll"]))
+		else:
+			# 如果是单文件
+			if path.get_extension().to_lower() == "dll":
+				all_target_files.append(path)
+	
+	var total_count = all_target_files.size()
 	var scanned_count = 0
 	
-	for file_path in all_files:
-		# === 🆕 插入点：优先检查 info.ini ===
-		if file_path.get_file() == "info.ini":
-			var is_banned = check_info_ini(file_path)
-			if is_banned:
-				issues_found += 1
-				print("🔴 发现封禁 ID: " + file_path)
-				continue # 如果确定是坏的，这个文件就不用往下扫了
-		# ===================================
+	# === 第二阶段：逐个扫描 (慢速，需要呼吸) ===
+	if total_count == 0:
+		result_text.text = "[color=yellow]❌ 未找到可审计的文件 (仅支持 .dll)[/color]"
+		status_label.text = "就绪"
+		is_scanning = false
+		return
+
+	for file_path in all_target_files:
 		scanned_count += 1
 		
-		# 每扫描5个文件刷新一次界面，防止卡死
+		# 💡 UI 交互优化：实时告诉用户进度
+		status_label.text = "正在审计: %d / %d" % [scanned_count, total_count]
+		
+		# 💡 防卡死核心：每处理 5 个文件，就暂停一帧，让 UI 喘口气
 		if scanned_count % 5 == 0:
-			status_label.text = "正在分析 (%d/%d): %s" % [scanned_count, all_files.size(), file_path.get_file()]
 			await get_tree().process_frame
-		
-		# --- 核心扫描逻辑 ---
-		var result = scan_single_file(file_path)
-		var score = result["score"]
-		
-		# --- 结果判定 (红绿灯机制) ---
-		if score >= 50:
-			# 🔴 红色高危
-			issues_found += 1
-			add_alert_card(file_path.get_file(), result["details"], Color.RED, score)
-			print("🔴 高危发现: " + file_path.get_file())
 			
-		elif score >= 20:
-			# 🟡 黄色可疑
-			issues_found += 1
-			add_alert_card(file_path.get_file(), result["details"], Color.ORANGE, score)
-			print("🟡 可疑文件: " + file_path.get_file())
-			
-		else:
-			# 🟢 绿色/灰色 (分数很低，忽略)
-			# print("🟢 安全/噪音: " + file_path.get_file() + " 分数: " + str(score))
-			pass
+		# 👇👇👇 关键修改点：加了 await 👇👇👇
+		var result = await scan_single_file(file_path)
+		
+		# 只有有发现才记录
+		if result["score"] > 0 or result["details"].size() > 0:
+			total_score += result["score"]
+			full_report += "\n[b]📄 文件: %s[/b]\n" % file_path.get_file()
+			for line in result["details"]:
+				full_report += line + "\n"
+			full_report += "[color=#444444]--------------------------------[/color]\n"
 
-	# === 最终结算 ===
-	if issues_found == 0:
-		status_label.text = "扫描完成：所有文件安全！(✅)"
-		status_label.modulate = Color.GREEN
-		# mascot.texture = load("res://happy_duck.png") # 如果你有图片的话
+	# === 第三阶段：生成报告 ===
+	var summary = ""
+	if total_score >= 50:
+		summary = "[color=red][b]🚫 高危警告 (风险分: %d)[/b][/color]\n发现明确的敏感权限特征，请在确认安全的情况下使用。\n" % total_score
+	elif total_score > 0:
+		summary = "[color=orange][b]⚠️ 需人工审查 (风险分: %d)[/b][/color]\n发现敏感操作，请查阅下方详情。\n" % total_score
 	else:
-		status_label.text = "警告：发现 %d 个潜在威胁！请检查列表。" % issues_found
-		status_label.modulate = Color.RED
-		# mascot.texture = load("res://angry_duck.png")
+		summary = "[color=#44ff44][b]✅ 未发现已知风险[/b][/color]\n(但这不代表绝对安全，请参考下方的能力透视)\n"
+	
+	if full_report == "":
+		full_report = "\n[i]未检测到任何敏感行为或特殊能力 API 调用。[/i]"
+		
+	result_text.text = summary + full_report
+	status_label.text = "审计完成 (共扫描 %d 个文件)" % scanned_count
+	
+	is_scanning = false # 🔓 解锁
+	
+# === 扫描引擎 ===
+# === 核心：单文件扫描引擎 v1.3.1 ===
+func scan_single_file(path: String) -> Dictionary:
+	var file_obj = FileAccess.open(path, FileAccess.READ)
+	if not file_obj: return {"score": 0, "details": []}
+	
+	var file_len = file_obj.get_length()
+	# 防卡死/防溢出检查 (20MB)
+	if file_len == 0 or file_len > MAX_FILE_SIZE: 
+		return {"score": 0, "details": ["[color=yellow]⚠️ 跳过: 文件过大 (>20MB) 或为空[/color]"]}
+	
+	var file_name = path.get_file()
+	var current_score = 0
+	var report_lines = [] 
+	
+	# 1. 读取并清洗内容 (使用异步流式清洗，防止截断和卡死)
+	var content_bytes = file_obj.get_buffer(file_len)
+	# 👇 关键: 必须使用 await 等待清洗完成
+	var content_cleaned = await extract_readable_text_async(content_bytes)
+	
+	var is_dll = path.get_extension().to_lower() == "dll"
+	
+	# 2. 基础架构检查 (Architecture)
+	if is_dll:
+		# 检查 .NET 签名 BSJB
+		if not "BSJB" in content_cleaned:
+			current_score += 100
+			report_lines.append("[color=red]🛑 [架构] 异常: 原生(Native)程序伪装成 Mod (Scav 1.5 特征)[/color]")
+		
+		# Harmony 特权判定
+		var is_real_harmony = "harmony" in file_name.to_lower() and ("Harmony" in content_cleaned or "0Harmony" in content_cleaned)
+		if is_real_harmony:
+			report_lines.append("[color=green]🛡️ [架构] 识别为 Harmony 补丁库 (已豁免底层内存操作)[/color]")
 
-# --- 辅助功能：递归获取文件 ---
-func get_all_files(path: String) -> Array:
+	# 3. 能力透视 (Capabilities) - 中性展示
+	var capabilities_found = []
+	for keyword in capability_rules:
+		if keyword in content_cleaned:
+			var desc = capability_rules[keyword]
+			if not desc in capabilities_found:
+				capabilities_found.append(desc)
+	
+	if capabilities_found.size() > 0:
+		report_lines.append("[color=#88ccff]⚡ [能力透视] 该 Mod 具备以下能力:[/color]")
+		for cap in capabilities_found:
+			report_lines.append("   └─ %s" % cap)
+
+	# 4. 风险检测 (Risks) - 计分
+	for pattern in compiled_risk_rules:
+		var regex = compiled_risk_rules[pattern]
+		
+		# 使用正则搜索
+		if regex.search(content_cleaned):
+			var rule_data = risk_rules[pattern]
+			var weight = rule_data[0]
+			var desc = rule_data[1]
+			
+			# --- 特殊逻辑：Quit 智能消噪 v1.3.1 ---
+			# 如果搜到了 "Quit"，为了防止误报普通单词 (如 Quite)，
+			# 我们这里做一个简单的单词边界检查 (虽然正则里也可以做，但代码里更灵活)
+			if pattern == "Quit":
+				# 如果内容里只是 "Quite" 或 "Equity"，regex 可能会误判（取决于是否用了 \b）
+				# 这里我们信任上面的正则规则，但如果想更保险，可以检查是否包含 UnityEngine
+				pass 
+
+			# --- 特权豁免逻辑 ---
+			# 只有 Harmony 允许调用 VirtualProtect/GetProcAddress/KERNEL32
+			var is_memory_op = "VirtualProtect" in pattern or "GetProcAddress" in pattern or "KERNEL32" in pattern
+			var is_real_harmony = "harmony" in file_name.to_lower() and "Harmony" in content_cleaned
+			
+			if is_memory_op and is_real_harmony:
+				continue # 豁免：这是补丁库的分内之事
+			
+			current_score += weight
+			
+			# 颜色逻辑: 高分红，低分橙
+			var line_color = "orange"
+			if weight >= 80: line_color = "red"
+			
+			report_lines.append("[color=%s]%s[/color]" % [line_color, desc])
+
+	return {
+		"score": current_score,
+		"details": report_lines
+	}
+# 这是一个每秒能处理几百MB的 C++ 封装调用
+# === ⚡ 异步清洗引擎 (Anti-Freeze & Anti-Truncation) ===
+# 这个函数现在是异步的，必须用 await 调用
+func extract_readable_text_async(bytes: PackedByteArray) -> String:
+	var size = bytes.size()
+	var chunk_size = 100000 # 每处理 10万 字节歇一次 (平衡速度与流畅度)
+	
+	# 我们直接在原始数组上修改，比字符串拼接快得多
+	# 将所有不可见字符(包括导致截断的 null)替换为空格(32)
+	for i in range(size):
+		var b = bytes[i]
+		# 如果是控制字符(0-31) 或 扩展ASCII(>126)，替换为空格
+		# 注意：保留换行符(10)和回车(13)可能有助于格式分析，但为了保险统统变空格也可以
+		if b < 32 or b > 126:
+			bytes[i] = 32 # Space
+		
+		# 防卡死机制：每处理一定数量，挂起一帧
+		if i % chunk_size == 0 and i > 0:
+			await get_tree().process_frame
+			
+	# 现在数组里没有 00 了，可以安全转换，不会被截断！
+	return bytes.get_string_from_ascii()
+	
+func get_all_files(path: String, extensions: Array) -> Array:
 	var files = []
 	var dir = DirAccess.open(path)
 	if dir:
@@ -196,136 +259,9 @@ func get_all_files(path: String) -> Array:
 		while file_name != "":
 			if dir.current_is_dir():
 				if file_name != "." and file_name != "..":
-					files.append_array(get_all_files(path + "/" + file_name))
+					files.append_array(get_all_files(path + "/" + file_name, extensions))
 			else:
-				files.append(path + "/" + file_name)
+				if file_name.get_extension().to_lower() in extensions:
+					files.append(path + "/" + file_name)
 			file_name = dir.get_next()
 	return files
-
-# --- 核心功能：清洗二进制乱码 ---
-func extract_readable_text(raw_bytes: PackedByteArray) -> String:
-	var safe_bytes = PackedByteArray()
-	for b in raw_bytes:
-		# 只保留 ASCII 可打印字符 (32-126) 以及 换行符
-		if (b >= 32 and b <= 126) or b == 10 or b == 13:
-			safe_bytes.append(b)
-	return safe_bytes.get_string_from_ascii()
-
-func scan_single_file(path: String) -> Dictionary:
-	var file_obj = FileAccess.open(path, FileAccess.READ)
-	if not file_obj: return {"score": 0, "details": []}
-	
-	var file_len = file_obj.get_length()
-	if file_len == 0: return {"score": 0, "details": []}
-	if file_len > MAX_FILE_SIZE: return {"score": 0, "details": []}
-	
-	var file_name = path.get_file()
-	var current_score = 0
-	var found_details = []
-	
-	# === 1. 读取并清洗 ===
-	var content_bytes = file_obj.get_buffer(file_len)
-	var content_cleaned = extract_readable_text(content_bytes)
-	var is_dll = path.get_extension().to_lower() == "dll"
-	
-	# === 2. 结构与伪装检查 (The Structure Check) ===
-	if is_dll:
-		# --- 身份验证 ---
-		var has_dotnet_magic = "BSJB" in content_cleaned
-		
-		# --- 伪装检测 ---
-		if not has_dotnet_magic:
-			current_score += 100
-			# [话术优化] 语气客观陈述事实
-			found_details.append("⚠️ 架构异常: 缺失 .NET 签名 (BSJB)")
-			found_details.append("   └─ 分析: 这是一个原生(Native)程序，而非标准的 C# Mod。请确认来源。")
-		else:
-			# --- 混淆/可读性检测 ---
-			var valid_markers = ["UnityEngine", "Assembly-CSharp", "BepInEx", "0Harmony", "System.Runtime", "mscorlib", "System"]
-			var looks_like_unity_mod = false
-			for marker in valid_markers:
-				if marker in content_cleaned:
-					looks_like_unity_mod = true
-					break
-			
-			var readability_ratio = float(content_cleaned.length()) / float(file_len)
-			
-			# [阈值微调] 稍微降低一点敏感度，避免误伤极简Mod
-			if not looks_like_unity_mod and readability_ratio < 0.01: 
-				current_score += 80
-				found_details.append("⚠️ 混淆疑虑: 文件可读信息密度极低 (%.2f%%)" % (readability_ratio * 100))
-				found_details.append("   └─ 提示: 无法识别常见Mod特征，疑似加壳或加密。")
-
-			# --- 违禁品搜身 (Harmony 豁免逻辑保持不变) ---
-			var is_real_harmony = "harmony" in file_name.to_lower() and ("Harmony" in content_cleaned or "0Harmony" in content_cleaned)
-			
-			for bad_api in forbidden_imports:
-				if bad_api in content_cleaned:
-					if is_real_harmony and bad_api in ["VirtualProtect", "GetProcAddress", "KERNEL32.dll", "LoadLibrary"]:
-						continue # 豁免
-					
-					current_score += forbidden_imports[bad_api]
-					# [话术优化] 强调是“底层调用”而不是“违禁品”
-					found_details.append("⚙️ 底层调用检测: %s" % bad_api)
-					
-					if looks_like_unity_mod and not is_real_harmony:
-						current_score += 40 # 稍微降分
-						found_details.append("   └─ 警告: 普通Mod通常不需要调用此系统内核接口。")
-
-	# === 3. 行为逻辑特征扫描 (使用新规则库) ===
-	for pattern in compiled_rules:
-		var regex = compiled_rules[pattern]
-		var match = regex.search(content_cleaned)
-		if match:
-			var weight = risk_rules[pattern]
-			current_score += weight
-			
-			var display_name = pattern.replace("\\", "")
-			# [话术优化] 使用“行为”而非“威胁”
-			found_details.append("🔍 敏感行为: %s (+%d)" % [display_name, weight])
-			
-			# 针对高危项的特殊提示
-			if "Quit" in display_name or "Exit" in display_name:
-				found_details.append("   └─ 🔴 高危: 包含强制退出游戏代码 (逻辑炸弹特征)")
-			elif "SteamID" in display_name:
-				found_details.append("   └─ 🟠 隐私: 包含读取 SteamID 的逻辑 (可能用于鉴权或黑名单)")
-			elif "Process.Start" in display_name:
-				found_details.append("   └─ 🟠 警告: 试图启动外部进程 (如打开网页或运行其他程序)")
-			elif "Upload" in display_name:
-				found_details.append("   └─ 🟠 警告: 试图上传数据到网络")
-
-	return {
-		"score": current_score,
-		"details": found_details
-	}
-	
-# --- UI功能：生成警告卡片 ---
-func add_alert_card(filename, details, color, score):
-	var card = Label.new()
-	# 组装提示文字
-	var text = "⚠️ %s [危险指数: %d]\n" % [filename, score]
-	for d in details:
-		text += "   └─ 发现: %s\n" % d
-		
-	card.text = text
-	card.modulate = color
-	result_container.add_child(card)
-	# 加个分隔线
-	var separator = HSeparator.new()
-	result_container.add_child(separator)
-
-# === 3. 特攻检测：扫描 info.ini ===
-func check_info_ini(path: String) -> bool:
-	var f = FileAccess.open(path, FileAccess.READ)
-	if not f: return false
-	
-	var content = f.get_as_text()
-	# 官方实锤封禁的恶意 Mod ID
-	if "3600714295" in content:
-		add_alert_card("info.ini", [
-			"🛑 官方封禁追杀令",
-			"   └─ 检测到 Mod ID: 3600714295",
-			"   └─ 结论: 这就是那个会导致闪退的恶意 Scav Mod，请立即删除！"
-		], Color.RED, 9999) # 分数给极高，置顶显示
-		return true # 发现问题
-	return false
