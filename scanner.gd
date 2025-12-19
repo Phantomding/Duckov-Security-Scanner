@@ -20,45 +20,33 @@ var forbidden_imports = {
 # 1. 威胁评分规则 (正则 : 分数)
 # 分数越高越危险。
 # 正则说明：(?!schemas) 是为了防止 xml 文件头里的 http 误报
+# === 优化后的规则库 v1.2 ===
 var risk_rules = {
-	# 🔴 毁灭级 (只要出现直接红名)
-	"cmd\\.exe": 100,
-	"powershell": 100,
-	"os\\.remove": 100,
-	"formatting C:": 100,
-	"WebClient\\.Upload": 100, # 上传文件
-	
-	# 🟡 可疑级 (单个出现可能是误报，多了就危险)
-	"http://(?!schemas)": 25, # 排除掉 schemas.microsoft.com
-	"UnityWebRequest": 25,     # Unity 联网
-	"Socket": 25,              # 底层网络套接字
-	"System\\.IO\\.File\\.Delete": 30, # 删除文件
-	"System\\.IO\\.Directory\\.Delete": 30,
-	
-	# 🟢 噪音级 (正常程序也常用，分很低，除非成堆出现否则忽略)
-	"System\\.Diagnostics": 5, 
-	"LoadLibrary": 10,
-	"get_IP": 10,
-	"WriteAllText": 5,
-	
-	# === 🆕 新增：逻辑炸弹防御 (针对 Scav 1.8.0 这类) ===
-	
-	# 1. 强制退出游戏 (Mod 绝不该拥有这个权限)
-	"Application\\.Quit": 100,      # Unity 退出函数
-	"Environment\\.Exit": 100,      # C# 系统退出函数
-	"Process\\.Kill": 100,          # 杀进程
-	"ForceCrash": 100,              # 某些游戏自带的崩溃测试函数
-	
-	# 2. 隐私窥探 (查户口)
-	"GetSteamID": 50,               # 获取 Steam ID (通常是为了比对黑名单)
-	"steamID": 20,                  # 变量名提及 (需警惕)
-	"m_SteamID": 20,
-	
-	# 3. 针对性封禁词汇 (作者可能直球写代码)
-	"Blacklist": 50,                # 黑名单
-	"BanList": 50,                  # 封禁列表
-	"IsBanned": 50,                 # "是否被封禁"
+	# --- 1. 进程与系统操作 (精准打击) ---
+	# "System\\.Diagnostics": 5,  <-- 删除！太容易误伤计时器等功能
+	"Process\\.Start": 25,        # 启动外部程序 (比如悄悄运行一个 .bat 或 .exe)
+	"Application\\.Quit": 100,    # 强制退出游戏 (逻辑炸弹核心)
+	"Environment\\.Exit": 100,    # 另一种强制退出
 
+	# --- 2. 敏感文件操作 ---
+	"File\\.Delete": 30,          # 删除文件 (正常Mod很少需要删文件)
+	"Directory\\.Delete": 30,     # 删除文件夹
+	"File\\.Copy": 10,            # 复制/覆盖文件 (可能是篡改)
+	
+	# --- 3. 网络行为 (区分“浏览”和“偷窃”) ---
+	# "System\\.Net": 5,          <-- 删除！只要联网就报毒太蠢了
+	"WebClient\\.Upload": 50,     # 上传数据 (偷隐私嫌疑大)
+	"HttpClient\\.Post": 30,      # 发送 POST 请求 (可能在上传)
+	"DownloadFile": 20,           # 下载文件 (如果是下载 exe 则是高危)
+	
+	# --- 4. 动态代码执行 (后门特征) ---
+	"Assembly\\.Load": 60,        # 动态加载二进制代码 (极度危险，类似远程控制)
+	"System\\.Reflection": 10,    # 反射 (正常Mod也会用，权重给低点，仅作提示)
+
+	# --- 5. 针对性恶意特征 ---
+	"SteamID": 40,                # 配合 Quit 使用通常是炸弹
+	"CheckSteamUID": 60,          # 恶意函数名特征
+	"3600714295": 1000            # 已知的恶意作者ID
 }
 
 # 2. 白名单指纹库 (文件名 : [合法的MD5列表])
@@ -229,33 +217,30 @@ func scan_single_file(path: String) -> Dictionary:
 	
 	var file_len = file_obj.get_length()
 	if file_len == 0: return {"score": 0, "details": []}
-	if file_len > MAX_FILE_SIZE: return {"score": 0, "details": []} # 跳过超大文件
+	if file_len > MAX_FILE_SIZE: return {"score": 0, "details": []}
 	
 	var file_name = path.get_file()
 	var current_score = 0
 	var found_details = []
 	
-	# === 1. 读取并清洗内容 ===
+	# === 1. 读取并清洗 ===
 	var content_bytes = file_obj.get_buffer(file_len)
 	var content_cleaned = extract_readable_text(content_bytes)
 	var is_dll = path.get_extension().to_lower() == "dll"
 	
-	# === 2. DLL 深度结构检查 (仅针对 DLL) ===
+	# === 2. 结构与伪装检查 (The Structure Check) ===
 	if is_dll:
-		# --- A. 身份验证 (.NET 签名) ---
+		# --- 身份验证 ---
 		var has_dotnet_magic = "BSJB" in content_cleaned
 		
-		# --- B. 伪装检测 (C++ 原生病毒) ---
+		# --- 伪装检测 ---
 		if not has_dotnet_magic:
-			# 绝大多数 Unity Mod 必须是 C# (带BSJB)。
-			# 如果是 DLL 但没有 BSJB，极大概率是伪装成 Mod 的原生病毒 (Scav 1.5 特征)
 			current_score += 100
-			found_details.append("🛑 伪装文件: 缺失 .NET 签名 (BSJB)")
-			found_details.append("   └─ 解析: 这是一个原生二进制文件(C++/Native)，而不是正常的 Mod。")
-		
+			# [话术优化] 语气客观陈述事实
+			found_details.append("⚠️ 架构异常: 缺失 .NET 签名 (BSJB)")
+			found_details.append("   └─ 分析: 这是一个原生(Native)程序，而非标准的 C# Mod。请确认来源。")
 		else:
-			# --- C. 混淆/加壳检测 (信息密度) ---
-			# 检查是否包含 Unity/Mod 开发的常用库
+			# --- 混淆/可读性检测 ---
 			var valid_markers = ["UnityEngine", "Assembly-CSharp", "BepInEx", "0Harmony", "System.Runtime", "mscorlib", "System"]
 			var looks_like_unity_mod = false
 			for marker in valid_markers:
@@ -263,62 +248,57 @@ func scan_single_file(path: String) -> Dictionary:
 					looks_like_unity_mod = true
 					break
 			
-			# 计算可读文本占比
 			var readability_ratio = float(content_cleaned.length()) / float(file_len)
 			
-			# 如果既没引用 Unity 库，可读性又极低 (<1.5%)，说明被强力混淆或加密了
-			if not looks_like_unity_mod and readability_ratio < 0.015:
+			# [阈值微调] 稍微降低一点敏感度，避免误伤极简Mod
+			if not looks_like_unity_mod and readability_ratio < 0.01: 
 				current_score += 80
-				found_details.append("🛑 高度混淆/加密检测")
-				found_details.append("   └─ 证据: 文件可读信息密度极低 (%.2f%%)，疑似加壳木马" % (readability_ratio * 100))
+				found_details.append("⚠️ 混淆疑虑: 文件可读信息密度极低 (%.2f%%)" % (readability_ratio * 100))
+				found_details.append("   └─ 提示: 无法识别常见Mod特征，疑似加壳或加密。")
 
-			# --- D. 🛡️ 违禁品搜身 (含 Harmony 豁免权) ---
-			# 1. 判断是否为真正的 Harmony 库 (防止改名伪装)
-			# 条件：文件名含 harmony 且 内容里确实有 Harmony 字符串
+			# --- 违禁品搜身 (Harmony 豁免逻辑保持不变) ---
 			var is_real_harmony = "harmony" in file_name.to_lower() and ("Harmony" in content_cleaned or "0Harmony" in content_cleaned)
 			
 			for bad_api in forbidden_imports:
 				if bad_api in content_cleaned:
-					# [豁免逻辑] 如果是真 Harmony，允许它调用内存操作函数 (因为它是补丁库)
 					if is_real_harmony and bad_api in ["VirtualProtect", "GetProcAddress", "KERNEL32.dll", "LoadLibrary"]:
-						# print("DEBUG: 已豁免 Harmony 的底层操作: ", bad_api)
-						continue
+						continue # 豁免
 					
-					# 否则，一律严查
 					current_score += forbidden_imports[bad_api]
-					found_details.append("☢️ 违禁品检测: 发现底层系统调用 (%s)" % bad_api)
+					# [话术优化] 强调是“底层调用”而不是“违禁品”
+					found_details.append("⚙️ 底层调用检测: %s" % bad_api)
 					
-					# 如果伪装成普通 Mod 却调内核，罪加一等
 					if looks_like_unity_mod and not is_real_harmony:
-						current_score += 50
-						found_details.append("   └─ 伪装警报: 该文件伪装成 Unity Mod，却在调用系统内核！")
+						current_score += 40 # 稍微降分
+						found_details.append("   └─ 警告: 普通Mod通常不需要调用此系统内核接口。")
 
-	# === 3. 行为逻辑特征扫描 (正则检测) ===
-	# 这一步针对所有文件，且 Harmony 没有豁免权 (Harmony 也不该写 Application.Quit)
+	# === 3. 行为逻辑特征扫描 (使用新规则库) ===
 	for pattern in compiled_rules:
 		var regex = compiled_rules[pattern]
-		# 搜索匹配项
 		var match = regex.search(content_cleaned)
 		if match:
 			var weight = risk_rules[pattern]
 			current_score += weight
 			
-			# 格式化显示名称 (去掉正则转义符)
 			var display_name = pattern.replace("\\", "")
-			found_details.append("⚡ 发现敏感行为: %s (+%d)" % [display_name, weight])
+			# [话术优化] 使用“行为”而非“威胁”
+			found_details.append("🔍 敏感行为: %s (+%d)" % [display_name, weight])
 			
-			# 如果是高危的逻辑炸弹，给出详细警告
-			if weight >= 50:
-				if "Quit" in display_name or "Exit" in display_name:
-					found_details.append("   └─ 警告: 检测到强制退出游戏代码 (逻辑炸弹特征)")
-				elif "SteamID" in display_name:
-					found_details.append("   └─ 警告: 检测到针对 SteamID 的隐私读取行为")
+			# 针对高危项的特殊提示
+			if "Quit" in display_name or "Exit" in display_name:
+				found_details.append("   └─ 🔴 高危: 包含强制退出游戏代码 (逻辑炸弹特征)")
+			elif "SteamID" in display_name:
+				found_details.append("   └─ 🟠 隐私: 包含读取 SteamID 的逻辑 (可能用于鉴权或黑名单)")
+			elif "Process.Start" in display_name:
+				found_details.append("   └─ 🟠 警告: 试图启动外部进程 (如打开网页或运行其他程序)")
+			elif "Upload" in display_name:
+				found_details.append("   └─ 🟠 警告: 试图上传数据到网络")
 
 	return {
 		"score": current_score,
 		"details": found_details
 	}
-
+	
 # --- UI功能：生成警告卡片 ---
 func add_alert_card(filename, details, color, score):
 	var card = Label.new()
