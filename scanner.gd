@@ -1,255 +1,247 @@
 extends Control
 
-# === 🦆 Duckov Mod Inspector v1.3 核心配置 ===
+# ==========================================
+# 🦆 Duckov Mod Inspector v1.6 (UI Card Update)
+# ==========================================
+
 const MAX_FILE_SIZE = 20 * 1024 * 1024 # 20MB 限制
-var compiled_risk_rules = {}
-var is_scanning = false # 🔒 扫描锁：防止重复拖拽导致卡死
-# 节点引用 (根据你刚才修改的结构)
+var is_scanning = false # 🔒 扫描锁
+
+# 📌 引用卡片预制体 (请确保路径正确)
+var card_scene = preload("res://FileResultCard.tscn")
+
+# 📌 节点引用
 @onready var status_label = $StatusLabel
-# 这里路径对应：MainScanner -> ResultScroll -> ResultText
-@onready var result_text = $ResultScroll/ResultText 
+# 注意：这里现在引用的是 VBoxContainer，不是原来的 RichTextLabel
+@onready var result_list = $ResultScroll/ResultList 
 
-# 1. ℹ️ 能力透视 (Capabilities) - 中性描述
-var capability_rules = {
-	"System\\.Net": "基础网络访问 (System.Net)",
-	"UnityWebRequest": "HTTP 联网能力 (UnityWebRequest)",
-	"Socket": "Socket 长连接 (聊天/联机)",
-	"System\\.IO": "文件读写操作 (System.IO)",
-	"File\\.Write": "写入/修改文件",
-	"File\\.Delete": "删除文件",
-	"Directory\\.Delete": "删除文件夹",
-	"PlayerPrefs": "读写游戏配置/注册表",
-	"Discord": "Discord SDK 集成",
-	"Steamworks": "Steam API 集成"
+# === 1. 核心定义: 风险等级 ===
+enum RiskLevel { INFO, WARNING, DANGER, CRITICAL }
+
+# === 2. 通用权限规则库 (Permission Rules) ===
+var permission_rules = {
+	# 🌐 网络通信
+	"Network": {
+		"System\\.Net": [RiskLevel.INFO, "基础网络库引用"],
+		"HttpClient": [RiskLevel.WARNING, "具备 HTTP 联网请求能力"],
+		"UnityWebRequest": [RiskLevel.WARNING, "Unity 引擎联网接口"],
+		"Socket": [RiskLevel.WARNING, "Socket 长连接 (聊天/P2P)"],
+		"WebClient": [RiskLevel.WARNING, "老式网络客户端"],
+		"UploadData": [RiskLevel.DANGER, "上传数据接口"],
+		"UploadString": [RiskLevel.DANGER, "上传文本接口"],
+		"discord\\.com": [RiskLevel.DANGER, "硬编码 Discord 链接 (疑似 Webhook)"],
+		"iplogger": [RiskLevel.CRITICAL, "包含 IP 追踪链接"]
+	},
+
+	# 📂 文件系统
+	"FileSystem": {
+		"System\\.IO": [RiskLevel.INFO, "基础文件操作库"],
+		"File\\.Delete": [RiskLevel.DANGER, "具备删除文件能力"],
+		"Directory\\.Delete": [RiskLevel.DANGER, "具备删除文件夹能力"],
+		"GetFiles": [RiskLevel.WARNING, "遍历文件列表"],
+		"PlayerPrefs": [RiskLevel.INFO, "读写游戏注册表/配置"],
+		"Environment\\.GetFolderPath": [RiskLevel.WARNING, "获取系统敏感路径 (如文档/桌面)"]
+	},
+
+	# ⚙️ 系统/进程
+	"System": {
+		"Process\\.Start": [RiskLevel.DANGER, "启动外部进程 (CMD/EXE)"],
+		"Environment\\.Exit": [RiskLevel.CRITICAL, "强制杀进程/退出游戏"],
+		"RegistryKey": [RiskLevel.DANGER, "操作 Windows 注册表"],
+		"Quit": [RiskLevel.WARNING, "调用退出逻辑 (Application.Quit)"]
+	},
+
+	# 🎭 动态执行/隐藏
+	"Reflection": {
+		"System\\.Reflection": [RiskLevel.INFO, "引用反射库 (动态执行)"],
+		"MethodBase\\.Invoke": [RiskLevel.WARNING, "动态调用未知函数"],
+		"Activator\\.CreateInstance": [RiskLevel.WARNING, "动态创建对象"],
+		"Assembly\\.Load": [RiskLevel.DANGER, "内存加载二进制代码 (Payload)"],
+		"Type\\.GetType": [RiskLevel.WARNING, "动态获取类型 (可能用于隐藏目标)"]
+	},
+
+	# 🆔 敏感信息
+	"Privacy": {
+		"SteamId": [RiskLevel.WARNING, "读取 SteamID"],
+		"CSteamID": [RiskLevel.WARNING, "Steam 身份结构"],
+		"session": [RiskLevel.WARNING, "包含 'session' 关键词"],
+		"wallet": [RiskLevel.DANGER, "包含钱包/支付关键词"]
+	}
 }
 
-# 2. 🚨 风险行为 (Risks) - 针对二进制拆解优化
-# 格式: "正则关键词": [分数, "显示的警告文本"]
-var risk_rules = {
-	# --- 🔴 极度高危 (逻辑炸弹) ---
-	"Environment\\.Exit": [100, "🔴 进程查杀: 包含强制终止进程代码 (Environment.Exit)"],
-	"3600714295": [1000, "🔴 黑名单: 已知恶意作者 ID"],
-	
-	# --- 🟠 高危行为 (拆解后的关键词，防止漏报) ---
-	# v1.3.1 修复: DLL中类名和方法名是分开存的，必须单搜 "Quit"
-	"Quit": [60, "🟠 退出逻辑: 发现 'Quit' 关键词 (可能包含 Application.Quit)"],
-	
-	# v1.3.1 修复: 针对 SteamID 的各种变形
-	"SteamId": [80, "🟠 身份读取: 发现 'SteamId' 属性引用"],
-	"CSteamID": [80, "🟠 身份读取: 发现 'CSteamID' 底层结构"],
-	"GetSteamID": [80, "🟠 身份读取: 发现获取 SteamID 的函数调用"],
-	
-	# --- 🟠 敏感操作 ---
-	"Process\\.Start": [40, "🟠 外部进程: 试图启动外部 EXE"],
-	"WebClient": [50, "🟠 网络组件: 发现 WebClient 引用"],
-	"HttpClient": [50, "🟠 网络组件: 发现 HttpClient 引用"],
-	"UploadString": [50, "🟠 数据上传: 发现上传字符串的代码"],
-	"UploadData": [50, "🟠 数据上传: 发现上传数据的代码"],
-	"Assembly\\.Load": [60, "🟠 动态加载: 试图加载二进制代码"],
-	
-	# --- 🟡 敏感 (Harmony豁免项) ---
-	"VirtualProtect": [20, "🟡 底层操作: 修改内存权限"],
-	"GetProcAddress": [20, "🟡 底层操作: 动态获取API地址"],
-	"KERNEL32": [20, "🟡 底层操作: 调用 Windows 内核 API"]
+# === 3. 意图推理规则库 (Context Engine) ===
+var intent_rules = {
+	"Discord_Steal": {
+		"cat_req": "Network",
+		"evidence": ["discord.com/api/webhooks", "discordapp.com/api/webhooks"],
+		"desc": "🔴 [意图分析] 疑似数据外传: 发现 Discord Webhook 链接"
+	},
+	"Local_Server": {
+		"cat_req": "Network",
+		"evidence": ["127.0.0.1", "localhost", "0.0.0.0"],
+		"desc": "🟢 [意图分析] 本地联机: 发现本地服务器回环地址"
+	},
+	"Auto_Update": {
+		"cat_req": "Network",
+		"evidence": ["github.com", "releases/latest", "raw.githubusercontent"],
+		"desc": "🔵 [意图分析] 自动更新: 发现 GitHub 仓库引用"
+	},
+	"Steam_P2P": {
+		"cat_req": "Network",
+		"evidence": ["SteamNetworking", "P2P"],
+		"desc": "🟢 [意图分析] Steam 联机: 使用官方 P2P 接口"
+	}
 }
+
+# 缓存正则
+var compiled_rules = {}
 
 func _ready():
-	DisplayServer.window_set_title("Duckov Mod Inspector v1.3")
+	DisplayServer.window_set_title("DMI v1.5 - Universal Audit")
 	
-	# 编译正则
-	for pattern in risk_rules:
-		var regex = RegEx.new()
-		regex.compile(pattern)
-		compiled_risk_rules[pattern] = regex
+	# 预编译正则
+	for category in permission_rules:
+		compiled_rules[category] = {}
+		for pattern in permission_rules[category]:
+			var regex = RegEx.new()
+			regex.compile(pattern)
+			compiled_rules[category][pattern] = regex
 	
-	# 连接全屏拖拽信号
 	get_viewport().files_dropped.connect(_on_files_dropped)
-	
-	status_label.text = "将 Mod (.dll) 拖入此处开始审计"
-	result_text.text = "[color=#888888]等待文件...[/color]"
+	status_label.text = "将 Mod (.dll) 拖入此处查看权限仪表盘"
 
 func _on_files_dropped(files):
-	# 🔒 1. 如果正在忙，直接忽略这次拖拽，防止卡死叠加
-	if is_scanning:
-		status_label.text = "⚠️ 正在忙，请稍后..."
-		return
-
-	is_scanning = true # 上锁
-	result_text.text = "" # 清空旧结果
+	if is_scanning: return
+	is_scanning = true
 	
-	var total_score = 0
-	var full_report = ""
-	var all_target_files = []
+	# === 1. 清空旧卡片 ===
+	for child in result_list.get_children():
+		child.queue_free()
 	
-	# === 第一阶段：收集文件 (快速) ===
-	status_label.text = "正在分析文件列表..."
-	await get_tree().process_frame # 强制刷新UI
+	var all_files = []
+	status_label.text = "正在解析文件列表..."
+	await get_tree().process_frame
 	
+	# 收集文件
 	for path in files:
 		if DirAccess.dir_exists_absolute(path):
-			# 如果是文件夹，获取里面所有dll
-			all_target_files.append_array(get_all_files(path, ["dll"]))
-		else:
-			# 如果是单文件
-			if path.get_extension().to_lower() == "dll":
-				all_target_files.append(path)
-	
-	var total_count = all_target_files.size()
-	var scanned_count = 0
-	
-	# === 第二阶段：逐个扫描 (慢速，需要呼吸) ===
-	if total_count == 0:
-		result_text.text = "[color=yellow]❌ 未找到可审计的文件 (仅支持 .dll)[/color]"
-		status_label.text = "就绪"
+			all_files.append_array(get_all_files(path, ["dll"]))
+		elif path.get_extension().to_lower() == "dll":
+			all_files.append(path)
+			
+	if all_files.size() == 0:
+		status_label.text = "❌ 未找到 .dll 文件 (仅支持 C# Mod)"
 		is_scanning = false
 		return
-
-	for file_path in all_target_files:
-		scanned_count += 1
 		
-		# 💡 UI 交互优化：实时告诉用户进度
-		status_label.text = "正在审计: %d / %d" % [scanned_count, total_count]
+	# 开始扫描
+	var total_scanned = 0
+	
+	for file_path in all_files:
+		total_scanned += 1
+		status_label.text = "正在审计: %d / %d" % [total_scanned, all_files.size()]
 		
-		# 💡 防卡死核心：每处理 5 个文件，就暂停一帧，让 UI 喘口气
-		if scanned_count % 5 == 0:
-			await get_tree().process_frame
+		# 每5个文件暂停一帧，防止UI卡顿
+		if total_scanned % 5 == 0: await get_tree().process_frame
+		
+		# === 2. 核心扫描 (获取数据) ===
+		var report = await scan_single_file(file_path)
+		
+		# === 3. 生成 UI 卡片 (Card) ===
+		var card = card_scene.instantiate()
+		result_list.add_child(card)
+		card.setup(report) # 将数据注入卡片
 			
-		# 👇👇👇 关键修改点：加了 await 👇👇👇
-		var result = await scan_single_file(file_path)
-		
-		# 只有有发现才记录
-		if result["score"] > 0 or result["details"].size() > 0:
-			total_score += result["score"]
-			full_report += "\n[b]📄 文件: %s[/b]\n" % file_path.get_file()
-			for line in result["details"]:
-				full_report += line + "\n"
-			full_report += "[color=#444444]--------------------------------[/color]\n"
+	status_label.text = "审计完成 (共 %d 个文件)" % total_scanned
+	is_scanning = false
 
-	# === 第三阶段：生成报告 ===
-	var summary = ""
-	if total_score >= 50:
-		summary = "[color=red][b]🚫 高危警告 (风险分: %d)[/b][/color]\n发现明确的敏感权限特征，请在确认安全的情况下使用。\n" % total_score
-	elif total_score > 0:
-		summary = "[color=orange][b]⚠️ 需人工审查 (风险分: %d)[/b][/color]\n发现敏感操作，请查阅下方详情。\n" % total_score
-	else:
-		summary = "[color=#44ff44][b]✅ 未发现已知风险[/b][/color]\n(但这不代表绝对安全，请参考下方的能力透视)\n"
-	
-	if full_report == "":
-		full_report = "\n[i]未检测到任何敏感行为或特殊能力 API 调用。[/i]"
-		
-	result_text.text = summary + full_report
-	status_label.text = "审计完成 (共扫描 %d 个文件)" % scanned_count
-	
-	is_scanning = false # 🔓 解锁
-	
-# === 扫描引擎 ===
-# === 核心：单文件扫描引擎 v1.3.1 ===
+# === 核心扫描引擎 (返回结构化数据) ===
 func scan_single_file(path: String) -> Dictionary:
 	var file_obj = FileAccess.open(path, FileAccess.READ)
-	if not file_obj: return {"score": 0, "details": []}
+	# 如果打开失败，返回空报告
+	if not file_obj: 
+		return {"filename": path.get_file(), "permissions": {}, "intents": [], "entropy": 0, "is_obfuscated": false}
 	
 	var file_len = file_obj.get_length()
-	# 防卡死/防溢出检查 (20MB)
-	if file_len == 0 or file_len > MAX_FILE_SIZE: 
-		return {"score": 0, "details": ["[color=yellow]⚠️ 跳过: 文件过大 (>20MB) 或为空[/color]"]}
-	
-	var file_name = path.get_file()
-	var current_score = 0
-	var report_lines = [] 
-	
-	# 1. 读取并清洗内容 (使用异步流式清洗，防止截断和卡死)
+	if file_len > MAX_FILE_SIZE:
+		return {"filename": path.get_file() + " (过大)", "permissions": {}, "intents": ["⚠️ 文件过大跳过扫描"], "entropy": 0, "is_obfuscated": false}
+
+	# 1. 异步清洗与分析
 	var content_bytes = file_obj.get_buffer(file_len)
-	# 👇 关键: 必须使用 await 等待清洗完成
-	var content_cleaned = await extract_readable_text_async(content_bytes)
+	var analysis = await extract_readable_text_async(content_bytes)
+	var content = analysis["text"]
+	var entropy = analysis["entropy"]
 	
-	var is_dll = path.get_extension().to_lower() == "dll"
-	
-	# 2. 基础架构检查 (Architecture)
-	if is_dll:
-		# 检查 .NET 签名 BSJB
-		if not "BSJB" in content_cleaned:
-			current_score += 100
-			report_lines.append("[color=red]🛑 [架构] 异常: 原生(Native)程序伪装成 Mod (Scav 1.5 特征)[/color]")
-		
-		# Harmony 特权判定
-		var is_real_harmony = "harmony" in file_name.to_lower() and ("Harmony" in content_cleaned or "0Harmony" in content_cleaned)
-		if is_real_harmony:
-			report_lines.append("[color=green]🛡️ [架构] 识别为 Harmony 补丁库 (已豁免底层内存操作)[/color]")
-
-	# 3. 能力透视 (Capabilities) - 中性展示
-	var capabilities_found = []
-	for keyword in capability_rules:
-		if keyword in content_cleaned:
-			var desc = capability_rules[keyword]
-			if not desc in capabilities_found:
-				capabilities_found.append(desc)
-	
-	if capabilities_found.size() > 0:
-		report_lines.append("[color=#88ccff]⚡ [能力透视] 该 Mod 具备以下能力:[/color]")
-		for cap in capabilities_found:
-			report_lines.append("   └─ %s" % cap)
-
-	# 4. 风险检测 (Risks) - 计分
-	for pattern in compiled_risk_rules:
-		var regex = compiled_risk_rules[pattern]
-		
-		# 使用正则搜索
-		if regex.search(content_cleaned):
-			var rule_data = risk_rules[pattern]
-			var weight = rule_data[0]
-			var desc = rule_data[1]
-			
-			# --- 特殊逻辑：Quit 智能消噪 v1.3.1 ---
-			# 如果搜到了 "Quit"，为了防止误报普通单词 (如 Quite)，
-			# 我们这里做一个简单的单词边界检查 (虽然正则里也可以做，但代码里更灵活)
-			if pattern == "Quit":
-				# 如果内容里只是 "Quite" 或 "Equity"，regex 可能会误判（取决于是否用了 \b）
-				# 这里我们信任上面的正则规则，但如果想更保险，可以检查是否包含 UnityEngine
-				pass 
-
-			# --- 特权豁免逻辑 ---
-			# 只有 Harmony 允许调用 VirtualProtect/GetProcAddress/KERNEL32
-			var is_memory_op = "VirtualProtect" in pattern or "GetProcAddress" in pattern or "KERNEL32" in pattern
-			var is_real_harmony = "harmony" in file_name.to_lower() and "Harmony" in content_cleaned
-			
-			if is_memory_op and is_real_harmony:
-				continue # 豁免：这是补丁库的分内之事
-			
-			current_score += weight
-			
-			# 颜色逻辑: 高分红，低分橙
-			var line_color = "orange"
-			if weight >= 80: line_color = "red"
-			
-			report_lines.append("[color=%s]%s[/color]" % [line_color, desc])
-
-	return {
-		"score": current_score,
-		"details": report_lines
+	# 2. 初始化报告对象
+	var report = {
+		"filename": path.get_file(),
+		"entropy": entropy,
+		"is_obfuscated": false,
+		"permissions": {}, # 结构: {"Network": [items], ...}
+		"intents": []
 	}
-# 这是一个每秒能处理几百MB的 C++ 封装调用
-# === ⚡ 异步清洗引擎 (Anti-Freeze & Anti-Truncation) ===
-# 这个函数现在是异步的，必须用 await 调用
-func extract_readable_text_async(bytes: PackedByteArray) -> String:
-	var size = bytes.size()
-	var chunk_size = 100000 # 每处理 10万 字节歇一次 (平衡速度与流畅度)
 	
-	# 我们直接在原始数组上修改，比字符串拼接快得多
-	# 将所有不可见字符(包括导致截断的 null)替换为空格(32)
+	# 3. 混淆判定 (Entropy Check)
+	if entropy > 7.2: report["is_obfuscated"] = true
+	
+	# 4. 权限扫描 (Permission Scan)
+	for category in compiled_rules:
+		report["permissions"][category] = []
+		var rules = compiled_rules[category]
+		
+		for pattern in rules:
+			var regex = rules[pattern]
+			if regex.search(content):
+				var raw_rule = permission_rules[category][pattern]
+				report["permissions"][category].append({
+					"keyword": pattern,
+					"level": raw_rule[0],
+					"desc": raw_rule[1]
+				})
+
+	# 5. 意图推理 (Intent Engine)
+	for intent_name in intent_rules:
+		var rule = intent_rules[intent_name]
+		var required_cat = rule["cat_req"]
+		
+		if report["permissions"].has(required_cat) and report["permissions"][required_cat].size() > 0:
+			for ev in rule["evidence"]:
+				if ev in content:
+					report["intents"].append(rule["desc"])
+					break 
+
+	return report
+
+# === ⚡ 异步清洗引擎 (含香农熵计算) ===
+func extract_readable_text_async(bytes: PackedByteArray) -> Dictionary:
+	var size = bytes.size()
+	var chunk_size = 100000 
+	var byte_counts = PackedInt64Array()
+	byte_counts.resize(256)
+	byte_counts.fill(0)
+	
 	for i in range(size):
 		var b = bytes[i]
-		# 如果是控制字符(0-31) 或 扩展ASCII(>126)，替换为空格
-		# 注意：保留换行符(10)和回车(13)可能有助于格式分析，但为了保险统统变空格也可以
-		if b < 32 or b > 126:
-			bytes[i] = 32 # Space
+		byte_counts[b] += 1 # 统计熵
 		
-		# 防卡死机制：每处理一定数量，挂起一帧
+		if (b < 32 and b != 10 and b != 13) or b > 126:
+			bytes[i] = 32 # 清洗为 Space
+		
 		if i % chunk_size == 0 and i > 0:
 			await get_tree().process_frame
 			
-	# 现在数组里没有 00 了，可以安全转换，不会被截断！
-	return bytes.get_string_from_ascii()
-	
+	# 计算熵
+	var entropy = 0.0
+	var total_float = float(size)
+	if total_float > 0:
+		for count in byte_counts:
+			if count > 0:
+				var p = float(count) / total_float
+				entropy -= p * (log(p) / log(2))
+				
+	return {"text": bytes.get_string_from_ascii(), "entropy": entropy}
+
+# === 辅助工具 ===
 func get_all_files(path: String, extensions: Array) -> Array:
 	var files = []
 	var dir = DirAccess.open(path)
