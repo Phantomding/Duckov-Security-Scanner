@@ -1,7 +1,7 @@
 extends PanelContainer
 
 # ==========================================
-# 📄 FileResultCard.gd (v1.6 Final)
+# 📄 FileResultCard.gd (v1.6.1 Safe Wording)
 # ==========================================
 
 @onready var status_icon = $VBoxContainer/HeaderBox/StatusIcon
@@ -44,7 +44,8 @@ func setup(report: Dictionary):
 	if max_risk == RiskLevel.INFO:
 		icon = "🔵"
 		title_color = "#88ccff" 
-		status_text = "功能型 Mod (安全)"
+		# ⚡️ 修改点 1: 避免使用"安全"绝对词汇
+		status_text = "功能型 Mod (常规)"
 		bg_color = Color("#112233") 
 		border_color = Color("#335577") 
 		
@@ -65,7 +66,8 @@ func setup(report: Dictionary):
 	else: # 纯净
 		icon = "✅"
 		title_color = "#44ff44" 
-		status_text = "纯净 Mod"
+		# ⚡️ 修改点 2: 使用客观描述代替"纯净"
+		status_text = "未检测出敏感权限"
 		bg_color = Color("#113322") 
 		border_color = Color("#337755") 
 
@@ -93,7 +95,8 @@ func setup(report: Dictionary):
 		text += "[color=orange]   └─ 警告: 未检测到 C# 特征，代码可能被加密或加壳。[/color]\n"
 	elif report.get("is_resource_heavy", false):
 		text += "[color=#eebb00]📦 [体积较大] 检测到大量内嵌资源 (Entropy: %.2f)[/color]\n" % report["entropy"]
-		text += "[color=#888888]   └─ 提示: 代码结构清晰，高熵值由图片/数据资源引起，通常安全。[/color]\n"
+		# ⚡️ 修改点 3: 将"通常安全"改为"低风险"
+		text += "[color=#888888]   └─ 提示: 代码结构清晰，高熵值由资源文件引起，属低风险特征。[/color]\n"
 	else:
 		text += "[color=#44ff44]🛡️ 代码结构清晰 (Entropy: %.2f)[/color]\n" % report["entropy"]
 	
