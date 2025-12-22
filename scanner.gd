@@ -1,7 +1,7 @@
 extends Control
 
 # ==========================================
-# 🛡️ D.M.I. v1.6 - Universal Mod Audit
+# 🛡️ D.M.I. v1.7 - Targeted Reinforcement
 # ==========================================
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024 
@@ -14,7 +14,7 @@ var card_scene = preload("res://FileResultCard.tscn")
 
 enum RiskLevel { INFO, WARNING, DANGER, CRITICAL }
 
-# === 权限规则库 ===
+# === 权限规则库 (v1.7 升级版) ===
 var permission_rules = {
 	"Network": {
 		"System\\.Net": [RiskLevel.INFO, "基础网络库引用"], 
@@ -31,10 +31,26 @@ var permission_rules = {
 	},
 	"FileSystem": {
 		"System\\.IO": [RiskLevel.INFO, "基础文件操作库"],
+		"File\\.Write": [RiskLevel.INFO, "写入文件 (通常是配置文件)"], 
+		"File\\.Copy": [RiskLevel.WARNING, "复制/克隆文件"], 
+		"File\\.Move": [RiskLevel.WARNING, "移动/重命名文件"], 
 		"File\\.Delete": [RiskLevel.DANGER, "具备删除文件能力"],
 		"Directory\\.Delete": [RiskLevel.DANGER, "具备删除文件夹能力"],
 		"GetFiles": [RiskLevel.WARNING, "遍历文件列表"],
-		"Environment\\.GetFolderPath": [RiskLevel.WARNING, "获取系统敏感路径 (如文档/桌面)"]
+		"Environment\\.GetFolderPath": [RiskLevel.WARNING, "获取系统敏感路径 (如文档/桌面)"],
+		"Environment\\.SpecialFolder": [RiskLevel.WARNING, "枚举系统特殊路径"],
+		
+		# 👇 修正点：Temp 降级为 INFO，因为它太常见了 (如 Harmony 缓存)
+		"Path\\.GetTempPath": [RiskLevel.INFO, "获取系统临时路径 (常见缓存操作)"],
+		"\\.tmp": [RiskLevel.INFO, "读写临时文件"],
+		
+		# 👇 真正的威胁交给这些特征去抓：
+		"System32": [RiskLevel.CRITICAL, "尝试访问 Windows 系统目录"],
+		"AppData": [RiskLevel.WARNING, "尝试访问 AppData"],
+		"\\.bat": [RiskLevel.DANGER, "涉及批处理脚本"],
+		"\\.cmd": [RiskLevel.DANGER, "涉及脚本执行"],
+		"\\.vbs": [RiskLevel.DANGER, "涉及 VBS 脚本"],
+		"\\.exe": [RiskLevel.DANGER, "涉及可执行文件操作"] # v1.7.1 补充
 	},
 	"System": {
 		"Process\\.Start": [RiskLevel.DANGER, "启动外部进程 (CMD/EXE)"],
@@ -49,8 +65,14 @@ var permission_rules = {
 		"Type\\.GetType": [RiskLevel.WARNING, "动态获取类型 (可能用于隐藏目标)"]
 	},
 	"Privacy": {
+		# 👇 v1.7: 大幅增强对 SteamID 和隐私文件的检测
 		"SteamId": [RiskLevel.WARNING, "读取 SteamID"],
 		"CSteamID": [RiskLevel.WARNING, "Steam 身份结构"],
+		"Steamworks": [RiskLevel.WARNING, "引用 Steamworks API (可能获取玩家身份)"], # v1.7
+		"GetSteamID": [RiskLevel.WARNING, "尝试获取 Steam ID"], # v1.7
+		"SteamUser": [RiskLevel.WARNING, "访问 Steam 用户数据"], # v1.7
+		"user\\.cfg": [RiskLevel.WARNING, "尝试读取用户配置文件"], # v1.7 (塔科夫常见)
+		"storage\\.json": [RiskLevel.WARNING, "尝试读取存档数据"], # v1.7
 		"wallet": [RiskLevel.DANGER, "包含钱包/支付关键词"]
 	}
 }
@@ -79,7 +101,6 @@ var intent_rules = {
 	},
 	"Reverse_Shell": {
 		"cat_req": "Network",
-		# ⚡️ v1.6 修正：移除了 System.Diagnostics.Process，防止误报
 		"evidence": ["cmd.exe", "/bin/sh", "powershell", "/bin/bash"],
 		"desc": "🚫 [高危意图] 远程控制: 发现 Socket 与命令行同时出现，疑似后门木马"
 	}
@@ -88,7 +109,7 @@ var intent_rules = {
 var compiled_rules = {}
 
 func _ready():
-	DisplayServer.window_set_title("D.M.I. v1.6 - Universal Mod Audit")
+	DisplayServer.window_set_title("D.M.I. v1.7 - Universal Mod Audit")
 	for category in permission_rules:
 		compiled_rules[category] = {}
 		for pattern in permission_rules[category]:
